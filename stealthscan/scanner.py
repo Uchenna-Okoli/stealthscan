@@ -9,25 +9,42 @@ def build_nmap_args(args):
     """Translate StealthScan flags into an Nmap argument string."""
     a = []
 
-    if args.syn:
+    # Scan type — Nmap's own flags
+    if args.ping:
+        a.append("-sn")
+    elif args.list_scan:
+        a.append("-sL")
+    elif args.syn:
         a.append("-sS")
     elif args.connect:
         a.append("-sT")
+    elif args.ack:
+        a.append("-sA")
     elif args.udp:
         a.append("-sU")
-    elif args.ping:
-        a.append("-sn")
 
-    if not args.ping:
-        a.extend(["-p", "1-65535"])
+    # Ports — only if the user asked for something specific
+    # (Nmap defaults to top 1000 if -p is omitted; StealthScan also defaults
+    # to top 1000 rather than all 65535 for speed unless -p- is given)
+    if args.ports:
+        a.extend(["-p", args.ports])
+    elif not (args.ping or args.list_scan):
+        a.extend(["-p", "1-65535"])  # full range by default
 
+    # Detection
     if args.service:
         a.append("-sV")
     if args.os:
         a.append("-O")
 
+    # NSE scripts
+    if args.script:
+        a.append(f"--script={args.script}")
+
+    # Timing
     a.append(f"-T{args.timing}")
 
+    # Stealth
     if args.decoys:
         a.extend(["-D", args.decoys])
     if args.source_port:
