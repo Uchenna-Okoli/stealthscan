@@ -16,38 +16,56 @@ from .vuln_matcher import match_services
 
 
 # ---------------------------------------------------------------------------
-# 1. Argument translation
+# Banner
+# ---------------------------------------------------------------------------
+
+BANNER = r"""
+  ____  _             _   _     ____
+ / ___|| |_ ___  ___ | |_| |_  / ___|  ___ __ _ _ __
+ \___ \| __/ _ \/ _ \| __| __| \___ \ / __/ _` | '_ \
+  ___) | ||  __/  __/| |_| |_   ___) | (_| (_| | | | |
+ |____/ \__\___|\___| \__|\__| |____/ \___\__,_|_| |_|
+        Nmap orchestration with CVE matching
+"""
+
+SUBTLE_BANNER = "\n  StealthScan v0.1.0 — Nmap orchestration with CVE matching\n"
+
+
+def print_banner(subtle=False):
+    """Print StealthScan's banner.
+
+    Interactive runs get the ASCII art. Scripted runs (--yes or -o given)
+    get a one-line header so the output stays clean for logs.
+    """
+    print(SUBTLE_BANNER if subtle else BANNER)
+
+
+# ---------------------------------------------------------------------------
+# Argument translation
 # ---------------------------------------------------------------------------
 
 def build_nmap_args(args):
     """Translate StealthScan's parsed CLI flags into an Nmap argument string.
 
-    Nmap is the actual scanning engine — this function just decides which
-    of Nmap's flags to pass through based on what the user asked for.
-
     Returns a single string, e.g. "-sS -p 1-65535 -sV -T4".
     """
     a = []
 
-    # ---- Scan type (mutually exclusive — enforced in cli.py) ----
+    # ---- Scan type ----
     if args.ping:
-        a.append("-sn")           # ping / host discovery only
+        a.append("-sn")
     elif args.list_scan:
-        a.append("-sL")           # list scan — resolve targets, send no packets
+        a.append("-sL")
     elif args.syn:
-        a.append("-sS")           # TCP SYN (stealth) scan
+        a.append("-sS")
     elif args.connect:
-        a.append("-sT")           # TCP connect scan
+        a.append("-sT")
     elif args.ack:
-        a.append("-sA")           # TCP ACK scan (firewall mapping)
+        a.append("-sA")
     elif args.udp:
-        a.append("-sU")           # UDP scan
+        a.append("-sU")
 
-    # ---- Port specification ----
-    # Precedence:
-    #   1. If user gave -p SPEC, use that literally.
-    #   2. Otherwise, if this is a scan that uses ports, default to full range.
-    #   3. If it's a ping or list scan, no -p flag at all.
+    # ---- Ports ----
     if getattr(args, "ports", None):
         a.extend(["-p", args.ports])
     elif not (args.ping or args.list_scan):
@@ -55,18 +73,18 @@ def build_nmap_args(args):
 
     # ---- Detection ----
     if args.service:
-        a.append("-sV")           # service/version detection
+        a.append("-sV")
     if args.os:
-        a.append("-O")            # OS detection
+        a.append("-O")
 
-    # ---- NSE scripts (vuln, vulners, etc.) ----
+    # ---- NSE scripts ----
     if getattr(args, "script", None):
         a.append(f"--script={args.script}")
 
-    # ---- Timing template ----
+    # ---- Timing ----
     a.append(f"-T{args.timing}")
 
-    # ---- Stealth / evasion ----
+    # ---- Stealth ----
     if args.decoys:
         a.extend(["-D", args.decoys])
     if args.source_port:
@@ -82,37 +100,11 @@ def build_nmap_args(args):
 
 
 # ---------------------------------------------------------------------------
-# 2. Terminal output
+# Terminal output
 # ---------------------------------------------------------------------------
 
 def print_results(results, findings):
-    """Print a human-readable scan report to the terminal.
-
-    `results` structure:
-        {
-            "10.0.0.1": {
-                "state": "up",
-                "protocols": {
-                    "tcp": {
-                        22:  {"state": "open",   "service": "ssh",  "product": "OpenSSH", "version": "8.4"},
-                        80:  {"state": "closed", "service": "http", "product": "", "version": ""},
-                    },
-                    "udp": { ... },
-                },
-            },
-            ...
-        }
-
-    `findings` structure:
-        {
-            "10.0.0.1": [
-                {"port": 22, "service": "OpenSSH 8.4",
-                 "id": "CVE-2023-12345", "score": 7.5, "severity": "HIGH",
-                 "description": "..."},
-                ...
-            ],
-        }
-    """
+    """Print a human-readable scan report to the terminal."""
     if not results:
         print("\n[!] No hosts returned any results.")
         print("[!] Check that the target is reachable and that you ran with sudo.")
@@ -152,7 +144,6 @@ def print_results(results, findings):
                         f"{svc:<15} {label}"
                     )
 
-        # CVE findings for this host
         host_cves = findings.get(host, []) if findings else []
         if host_cves:
             print(f"\n  CVEs found on {host}:")
@@ -169,28 +160,21 @@ def print_results(results, findings):
 
 
 # ---------------------------------------------------------------------------
-# 3. Main scan entry point
+# Main scan entry point
 # ---------------------------------------------------------------------------
 
 def run_scan(args):
-    """Execute a scan based on parsed CLI args.
-
-    Steps:
-      1. Expand/normalize the target list.
-      2. Ask for confirmation (unless --yes was given).
-      3. Hand the work to Nmap via python-nmap.
-      4. Parse Nmap's structured result into a plain dict.
-      5. Optionally run CVE matching against the detected services.
-      6. Print a human-readable report.
-      7. Export the same data to files if the user asked for output.
-    """
+    """Execute a scan based on parsed CLI args."""
     targets = expand_targets(args.targets)
 
-    # 1. Confirmation gate (skipped with --yes)
+    # Banner — subtle if scripted
+    print_banner(subtle=bool(args.output) or args.yes)
+
+    # Confirmation gate
     if not args.yes:
         confirm_scan(targets, build_nmap_args(args))
 
-    # 2. Build and run the Nmap command
+    # Run Nmap
     nm = nmap.PortScanner()
     nmap_str = build_nmap_args(args)
     print(f"[*] Running: nmap {nmap_str} {' '.join(targets)}")
@@ -203,7 +187,7 @@ def run_scan(args):
         print(f"[!] Command was: nmap {nmap_str} {' '.join(targets)}")
         return {}, {}
 
-    # 3. Extract results into a plain dict
+    # Extract results
     results = {}
     for host in nm.all_hosts():
         results[host] = {"state": nm[host].state(), "protocols": {}}
@@ -222,19 +206,16 @@ def run_scan(args):
     if not results:
         print(f"[!] No hosts returned results.")
         print(f"[!] Nmap command was: nmap {nmap_str} {' '.join(targets)}")
-        print(f"[!] Try running that command directly to see why.")
         return {}, {}
 
-    # 4. Optional CVE matching
+    # CVE matching
     findings = {}
     if getattr(args, "vuln", False):
         print("\n[*] Running CVE lookup against NVD...")
         findings = match_services(results, min_cvss=args.min_cvss)
 
-    # 5. Terminal output
+    # Output
     print_results(results, findings)
-
-    # 6. File export (only if -o was given, OR always — adjust as you prefer)
     export(results, findings, args)
 
     return results, findings
