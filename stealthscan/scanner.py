@@ -1,57 +1,35 @@
-"""Nmap orchestration layer for StealthScan.
-
-This module is responsible for:
-  1. Translating StealthScan's CLI flags into an Nmap argument string.
-  2. Running Nmap via python-nmap (which shells out to the system nmap binary).
-  3. Parsing Nmap's structured output into a plain dict.
-  4. Running optional CVE matching.
-  5. Printing a human-readable report to the terminal.
-  6. Exporting the same data to JSON / CSV / text files.
-"""
+"""StealthScan orchestration layer."""
 import nmap
+import time
+import sys
 
 from .utils import confirm_scan, expand_targets
 from .report import export
 from .vuln_matcher import match_services
 
 
-# ---------------------------------------------------------------------------
-# Banner
-# ---------------------------------------------------------------------------
-
 BANNER = r"""
-  ____  _             _   _     ____
- / ___|| |_ ___  ___ | |_| |_  / ___|  ___ __ _ _ __
- \___ \| __/ _ \/ _ \| __| __| \___ \ / __/ _` | '_ \
-  ___) | ||  __/  __/| |_| |_   ___) | (_| (_| | | | |
- |____/ \__\___|\___| \__|\__| |____/ \___\__,_|_| |_|
-        Nmap orchestration with CVE matching
+╭─────────────────────────────────────────────────────────────╮
+│                                                             │
+│   StealthScan  v0.1.0                                       │
+│   Network reconnaissance and vulnerability matching         │
+│                                                             │
+│   For authorized testing only.                              │
+│                                                             │
+╰─────────────────────────────────────────────────────────────╯
 """
 
-SUBTLE_BANNER = "\n  StealthScan v0.1.0 — Nmap orchestration with CVE matching\n"
+SUBTLE_BANNER = "\n  StealthScan v0.1.0 — For authorized testing only.\n"
 
 
 def print_banner(subtle=False):
-    """Print StealthScan's banner.
-
-    Interactive runs get the ASCII art. Scripted runs (--yes or -o given)
-    get a one-line header so the output stays clean for logs.
-    """
     print(SUBTLE_BANNER if subtle else BANNER)
 
 
-# ---------------------------------------------------------------------------
-# Argument translation
-# ---------------------------------------------------------------------------
-
-def build_nmap_args(args):
-    """Translate StealthScan's parsed CLI flags into an Nmap argument string.
-
-    Returns a single string, e.g. "-sS -p 1-65535 -sV -T4".
-    """
+def build_engine_args(args):
+    """Translate CLI flags into the engine argument string."""
     a = []
 
-    # ---- Scan type ----
     if args.ping:
         a.append("-sn")
     elif args.list_scan:
@@ -65,26 +43,34 @@ def build_nmap_args(args):
     elif args.udp:
         a.append("-sU")
 
-    # ---- Ports ----
-    if getattr(args, "ports", None):
+    # Ports
+    if args.ping or args.list_scan:
+        pass
+    elif getattr(args, "ports", None):
         a.extend(["-p", args.ports])
-    elif not (args.ping or args.list_scan):
-        a.extend(["-p", "1-65535"])
+    elif getattr(args, "top_ports", None):
+        a.extend(["--top-ports", str(args.top_ports)])
+    else:
+        a.extend(["--top-ports", "1000"])
 
-    # ---- Detection ----
     if args.service:
         a.append("-sV")
+        a.append("--version-intensity")
+        a.append("2")
     if args.os:
         a.append("-O")
+        a.append("--max-os-tries")
+        a.append("1")
 
-    # ---- NSE scripts ----
     if getattr(args, "script", None):
         a.append(f"--script={args.script}")
 
-    # ---- Timing ----
     a.append(f"-T{args.timing}")
+    a.append("--max-retries")
+    a.append("1")
+    if getattr(args, "rate", None):
+        a.extend(["--min-rate", str(args.rate)])
 
-    # ---- Stealth ----
     if args.decoys:
         a.extend(["-D", args.decoys])
     if args.source_port:
@@ -93,26 +79,26 @@ def build_nmap_args(args):
         a.append("-f")
     if args.randomize:
         a.append("--randomize-hosts")
-    if args.rate:
-        a.extend(["--min-rate", str(args.rate)])
 
     return " ".join(a)
 
 
-# ---------------------------------------------------------------------------
-# Terminal output
-# ---------------------------------------------------------------------------
+build_nmap_args = build_engine_args
 
-def print_results(results, findings):
-    """Print a human-readable scan report to the terminal."""
+
+def print_results(results, findings, elapsed):
     if not results:
-        print("\n[!] No hosts returned any results.")
-        print("[!] Check that the target is reachable and that you ran with sudo.")
+        print("\n[!] No hosts found.")
         return
 
     print("\n" + "=" * 74)
     print("  STEALTHSCAN RESULTS")
     print("=" * 74)
+    print(f"  Hosts scanned: {len(results)}   Time: {elapsed:.2f}s")
+    print("=" * 74)
+
+    total_open = 0
+    total_cves = 0
 
     for host in sorted(results.keys()):
         hdata = results[host]
@@ -120,29 +106,28 @@ def print_results(results, findings):
         print(f"\n[HOST] {host}  —  state: {state}")
 
         protocols = hdata.get("protocols", {})
-        if not protocols:
-            print("  (no ports reported by Nmap)")
+        has_ports = any(ports for ports in protocols.values())
+
+        if not has_ports:
+            print("  (no ports detected by StealthScan)")
         else:
             for proto in sorted(protocols.keys()):
                 ports = protocols[proto]
                 if not ports:
-                    print(f"  {proto.upper()}: no ports")
                     continue
-
                 print(f"\n  {proto.upper()} ports:")
                 print(f"  {'PORT':<8} {'STATE':<12} {'SERVICE':<15} VERSION")
                 print(f"  {'-' * 8} {'-' * 12} {'-' * 15} {'-' * 30}")
-
                 for port in sorted(ports.keys()):
                     pdata = ports[port]
                     svc = pdata.get("service", "") or "-"
                     prod = pdata.get("product", "") or ""
                     ver = pdata.get("version", "") or ""
                     label = (f"{prod} {ver}".strip() or "-")[:44]
-                    print(
-                        f"  {port:<8} {pdata.get('state', '?'):<12} "
-                        f"{svc:<15} {label}"
-                    )
+                    print(f"  {port:<8} {pdata.get('state', '?'):<12} "
+                          f"{svc:<15} {label}")
+                    if pdata.get("state") == "open":
+                        total_open += 1
 
         host_cves = findings.get(host, []) if findings else []
         if host_cves:
@@ -155,39 +140,43 @@ def print_results(results, findings):
                 print(f"    [!] {cid}  (CVSS {score})  port {port}")
                 if desc:
                     print(f"        {desc}...")
+                total_cves += 1
 
-    print("\n" + "=" * 74 + "\n")
+    print("\n" + "=" * 74)
+    print(f"  SUMMARY: {len(results)} host(s), {total_open} open port(s), "
+          f"{total_cves} CVE(s)")
+    print("=" * 74 + "\n")
 
-
-# ---------------------------------------------------------------------------
-# Main scan entry point
-# ---------------------------------------------------------------------------
 
 def run_scan(args):
-    """Execute a scan based on parsed CLI args."""
     targets = expand_targets(args.targets)
 
-    # Banner — subtle if scripted
     print_banner(subtle=bool(args.output) or args.yes)
 
-    # Confirmation gate
     if not args.yes:
-        confirm_scan(targets, build_nmap_args(args))
+        confirm_scan(targets, build_engine_args(args))
 
-    # Run Nmap
+    engine_args = build_engine_args(args)
+    print(f"[*] StealthScan scanning: {' '.join(targets)}")
+    print(f"[*] Mode: {_describe_mode(args)}")
+    print("[*] Scanning...")
+
     nm = nmap.PortScanner()
-    nmap_str = build_nmap_args(args)
-    print(f"[*] Running: nmap {nmap_str} {' '.join(targets)}")
-    print("[*] Scanning... (this can take a while for large port ranges)")
+    start = time.time()
 
     try:
-        nm.scan(hosts=" ".join(targets), arguments=nmap_str)
+        nm.scan(hosts=" ".join(targets), arguments=engine_args)
+    except KeyboardInterrupt:
+        elapsed = time.time() - start
+        print(f"\n[!] Scan interrupted by user after {elapsed:.2f}s.")
+        sys.exit(130)
     except nmap.PortScannerError as e:
-        print(f"[!] Nmap error: {e}")
-        print(f"[!] Command was: nmap {nmap_str} {' '.join(targets)}")
+        print(f"[!] Scan engine error: {e}")
+        print(f"[!] Engine command was: nmap {engine_args} {' '.join(targets)}")
         return {}, {}
 
-    # Extract results
+    elapsed = time.time() - start
+
     results = {}
     for host in nm.all_hosts():
         results[host] = {"state": nm[host].state(), "protocols": {}}
@@ -204,18 +193,38 @@ def run_scan(args):
                 }
 
     if not results:
-        print(f"[!] No hosts returned results.")
-        print(f"[!] Nmap command was: nmap {nmap_str} {' '.join(targets)}")
+        print(f"[!] No hosts returned results after {elapsed:.2f}s.")
         return {}, {}
 
-    # CVE matching
     findings = {}
     if getattr(args, "vuln", False):
-        print("\n[*] Running CVE lookup against NVD...")
+        print("\n[*] Matching services against known CVEs...")
         findings = match_services(results, min_cvss=args.min_cvss)
 
-    # Output
-    print_results(results, findings)
+    print_results(results, findings, elapsed)
     export(results, findings, args)
-
     return results, findings
+
+
+def _describe_mode(args):
+    parts = []
+    if args.ping:
+        parts.append("ping sweep")
+    elif args.list_scan:
+        parts.append("list scan")
+    elif args.syn:
+        parts.append("TCP SYN")
+    elif args.connect:
+        parts.append("TCP connect")
+    elif args.ack:
+        parts.append("TCP ACK")
+    elif args.udp:
+        parts.append("UDP")
+    if args.service:
+        parts.append("service detection")
+    if args.os:
+        parts.append("OS detection")
+    if getattr(args, "script", None):
+        parts.append(f"NSE:{args.script}")
+    parts.append(f"timing T{args.timing}")
+    return ", ".join(parts)
