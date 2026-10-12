@@ -10,7 +10,7 @@ def _normalize_argv(argv):
     """Rewrite Nmap-style single-dash flags into double-dash equivalents."""
     single_dash_flags = {
         "-sn", "-sL", "-sS", "-sT", "-sA", "-sU", "-sV",
-        "-O", "-p",
+        "-sF", "-sN", "-sX", "-O", "-p",
     }
     out = []
     for tok in argv:
@@ -60,6 +60,12 @@ def build_parser():
                    help="TCP connect scan")
     g.add_argument("--sA", "--ack", action="store_true", dest="ack",
                    help="TCP ACK scan")
+    g.add_argument("--sF", "--fin", action="store_true", dest="fin",
+                   help="TCP FIN scan")
+    g.add_argument("--sN", "--null", action="store_true", dest="null",
+                   help="TCP NULL scan")
+    g.add_argument("--sX", "--xmas", action="store_true", dest="xmas",
+                   help="TCP Xmas scan")
     g.add_argument("--sU", "--udp", action="store_true", dest="udp",
                    help="UDP scan")
 
@@ -115,10 +121,12 @@ def _finalize(args):
     if not args.targets:
         raise SystemExit("[!] No targets given. Provide an IP, CIDR, or --subnet.")
 
-    scans = [args.ping, args.list_scan, args.syn,
-             args.connect, args.ack, args.udp]
+    scans = [args.ping, args.list_scan, args.syn, args.connect,
+             args.ack, args.fin, args.null, args.xmas, args.udp]
     if sum(bool(x) for x in scans) > 1:
-        raise SystemExit("[!] Choose only one of: -sn, -sL, -sS, -sT, -sA, -sU")
+        raise SystemExit(
+            "[!] Choose only one of: -sn, -sL, -sS, -sT, -sA, -sF, -sN, -sX, -sU"
+        )
 
     # --script=vuln implies service detection and enables CVE matching.
     if args.script and "vuln" in args.script:
@@ -127,11 +135,9 @@ def _finalize(args):
     if args.all_ports:
         args.ports = "-"
 
-    # --full is a subnet convenience: expand to all ports
     if args.full and not args.ports and not args.top_ports:
         args.ports = "-"
 
-    # Default scan type: SYN
     if not any(scans):
         args.syn = True
 

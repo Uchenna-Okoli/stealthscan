@@ -1,33 +1,37 @@
-"""StealthScan orchestration layer."""
+"""SSCAN orchestration layer."""
 import nmap
-import time
 import sys
+import time
 
 from .utils import confirm_scan, expand_targets
 from .report import export
 from .vuln_matcher import match_services
+from . import risk
 
 
 BANNER = r"""
 ╭─────────────────────────────────────────────────────────────╮
 │                                                             │
-│   StealthScan  v0.1.0                                       │
-│   Network reconnaissance and vulnerability matching         │
+│   SSCAN  v0.2.0                                             │
+│   Network reconnaissance and vulnerability assessment       │
 │                                                             │
 │   For authorized testing only.                              │
 │                                                             │
 ╰─────────────────────────────────────────────────────────────╯
 """
 
-SUBTLE_BANNER = "\n  StealthScan v0.1.0 — For authorized testing only.\n"
+SUBTLE_BANNER = "\n  SSCAN v0.2.0 — For authorized testing only.\n"
 
 
 def print_banner(subtle=False):
     print(SUBTLE_BANNER if subtle else BANNER)
 
 
+# ---------------------------------------------------------------------------
+# Argument translation
+# ---------------------------------------------------------------------------
+
 def build_engine_args(args):
-    """Translate CLI flags into the engine argument string."""
     a = []
 
     if args.ping:
@@ -40,10 +44,15 @@ def build_engine_args(args):
         a.append("-sT")
     elif args.ack:
         a.append("-sA")
+    elif getattr(args, "fin", False):
+        a.append("-sF")
+    elif getattr(args, "null", False):
+        a.append("-sN")
+    elif getattr(args, "xmas", False):
+        a.append("-sX")
     elif args.udp:
         a.append("-sU")
 
-    # Ports
     if args.ping or args.list_scan:
         pass
     elif getattr(args, "ports", None):
@@ -86,70 +95,138 @@ def build_engine_args(args):
 build_nmap_args = build_engine_args
 
 
-def print_results(results, findings, elapsed):
+# ---------------------------------------------------------------------------
+# Terminal output
+# ---------------------------------------------------------------------------
+
+def print_host_report(host, hdata, host_findings, assessment):
+    """Print a single host's report."""
+    state = hdata.get("state", "unknown")
+    tier = assessment["host_tier"]
+    hrisk = assessment["host_risk"]
+    print(f"\n[HOST] {host}  —  state: {state}   RISK: {tier} ({hrisk:.1f})")
+
+    protocols = hdata.get("protocols", {})
+    has_ports = any(p for p in protocols.values())
+
+    if not has_ports:
+        print("  (no ports detected by SSCAN)")
+    else:
+        for proto in sorted(protocols.keys()):
+            ports = protocols[proto]
+            if not ports:
+                continue
+            print(f"\n  {proto.upper()} ports:")
+            print(f"  {'PORT':<8} {'STATE':<10} {'SERVICE':<14} "
+                  f"{'VERSION':<28} {'CVEs':<5} {'MAX':<5} RISK")
+            print(f"  {'-'*8} {'-'*10} {'-'*14} {'-'*28} {'-'*5} {'-'*5} {'-'*10}")
+
+            for port in sorted(ports.keys()):
+                p = ports[port]
+                pa = assessment["ports"].get(port, {})
+                svc = (p.get("service") or "-")[:14]
+                prod = p.get("product") or ""
+                ver = p.get("version") or ""
+                label = (f"{prod} {ver}".strip() or "-")[:28]
+                ccount = pa.get("cve_count", 0)
+                maxcvss = pa.get("max_cvss", 0.0)
+                ptier = pa.get("top_tier", "NONE")
+                print(f"  {port:<8} {p.get('state', '?'):<10} {svc:<14} "
+                      f"{label:<28} {ccount:<5} {maxcvss:<5.1f} {ptier}")
+
+    if host_findings:
+        print(f"\n  Detected CVEs on {host}:")
+        for v in host_findings[:20]:
+            cid = v.get("id", "?")
+            score = v.get("score", 0.0)
+            tier2 = risk.cvss_to_tier(score)
+            port = v.get("port", "?")
+            desc = (v.get("description", "") or "")[:90]
+            print(f"    [{port}] {cid:<16} CVSS {score:>4.1f}  {tier2:<8}  {desc}")
+        if len(host_findings) > 20:
+            print(f"    ... and {len(host_findings) - 20} more")
+
+    # Vulnerability density
+    if assessment["open_ports"] > 0:
+        print(f"\n  Vulnerability density: "
+              f"{assessment['ports_with_cves']} of {assessment['open_ports']} "
+              f"open ports have CVEs ({assessment['density_pct']}%)")
+        print(f"  High-severity density: "
+              f"{assessment['high_severity_pct']}% of open ports have "
+              f"CVEs with CVSS >= 7.0")
+
+
+def print_network_summary(net_assessment, cidr):
+    """Print subnet-level aggregate."""
+    print("\n" + "=" * 74)
+    print(f"  NETWORK RISK SUMMARY — {cidr}")
+    print("=" * 74)
+    print(f"  Hosts scanned:    {net_assessment['hosts_scanned']}")
+    print(f"  Hosts up:         {net_assessment['hosts_up']}")
+    print(f"  Hosts with CVEs:  {net_assessment['hosts_with_cves']}")
+    print(f"  Total open ports: {net_assessment['total_open_ports']}")
+    print(f"  Total CVEs:       {net_assessment['total_cves']}")
+    print()
+
+    tc = net_assessment["tier_counts"]
+    bar_max = max(tc.values()) if tc.values() else 1
+    for tier in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "CLEAN"]:
+        count = tc.get(tier, 0)
+        bar = "█" * int((count / bar_max) * 30) if bar_max else ""
+        print(f"    {tier:<9} {count:>3}   {bar}")
+
+    print()
+    print(f"  Network risk:   {net_assessment['network_tier']} "
+          f"({net_assessment['network_risk']:.1f})")
+    print(f"  Density:        {net_assessment['network_density_pct']}% of "
+          f"open ports have CVEs")
+    print("=" * 74 + "\n")
+
+
+def print_results(results, findings, elapsed, cidr=None):
     if not results:
         print("\n[!] No hosts found.")
         return
 
     print("\n" + "=" * 74)
-    print("  STEALTHSCAN RESULTS")
+    print("  SSCAN RESULTS")
     print("=" * 74)
     print(f"  Hosts scanned: {len(results)}   Time: {elapsed:.2f}s")
     print("=" * 74)
 
-    total_open = 0
-    total_cves = 0
+    net_assessment = risk.assess_network(results, findings)
 
     for host in sorted(results.keys()):
-        hdata = results[host]
-        state = hdata.get("state", "unknown")
-        print(f"\n[HOST] {host}  —  state: {state}")
+        assessment = net_assessment["hosts"].get(host)
+        if assessment is None:
+            assessment = risk.assess_host(results[host], findings.get(host, []))
+        print_host_report(host, results[host],
+                          findings.get(host, []), assessment)
 
-        protocols = hdata.get("protocols", {})
-        has_ports = any(ports for ports in protocols.values())
+    # Subnet summary if there are multiple hosts
+    if len(results) > 1:
+        label = cidr or "(multiple targets)"
+        print_network_summary(net_assessment, label)
+    else:
+        # Single host — show a compact summary line
+        h = next(iter(net_assessment["hosts"].values()))
+        print(f"\n  Summary: {h['total_cves']} CVE(s) across "
+              f"{h['open_ports']} open port(s), tier {h['host_tier']}.")
 
-        if not has_ports:
-            print("  (no ports detected by StealthScan)")
-        else:
-            for proto in sorted(protocols.keys()):
-                ports = protocols[proto]
-                if not ports:
-                    continue
-                print(f"\n  {proto.upper()} ports:")
-                print(f"  {'PORT':<8} {'STATE':<12} {'SERVICE':<15} VERSION")
-                print(f"  {'-' * 8} {'-' * 12} {'-' * 15} {'-' * 30}")
-                for port in sorted(ports.keys()):
-                    pdata = ports[port]
-                    svc = pdata.get("service", "") or "-"
-                    prod = pdata.get("product", "") or ""
-                    ver = pdata.get("version", "") or ""
-                    label = (f"{prod} {ver}".strip() or "-")[:44]
-                    print(f"  {port:<8} {pdata.get('state', '?'):<12} "
-                          f"{svc:<15} {label}")
-                    if pdata.get("state") == "open":
-                        total_open += 1
 
-        host_cves = findings.get(host, []) if findings else []
-        if host_cves:
-            print(f"\n  CVEs found on {host}:")
-            for v in host_cves:
-                cid = v.get("id", "?")
-                score = v.get("score", 0.0)
-                port = v.get("port", "?")
-                desc = (v.get("description", "") or "")[:100]
-                print(f"    [!] {cid}  (CVSS {score})  port {port}")
-                if desc:
-                    print(f"        {desc}...")
-                total_cves += 1
-
-    print("\n" + "=" * 74)
-    print(f"  SUMMARY: {len(results)} host(s), {total_open} open port(s), "
-          f"{total_cves} CVE(s)")
-    print("=" * 74 + "\n")
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def run_scan(args):
     targets = expand_targets(args.targets)
+
+    # Detect if this is a subnet scan
+    cidr = None
+    for t in targets:
+        if "/" in t:
+            cidr = t
+            break
 
     print_banner(subtle=bool(args.output) or args.yes)
 
@@ -157,7 +234,7 @@ def run_scan(args):
         confirm_scan(targets, build_engine_args(args))
 
     engine_args = build_engine_args(args)
-    print(f"[*] StealthScan scanning: {' '.join(targets)}")
+    print(f"[*] SSCAN scanning: {' '.join(targets)}")
     print(f"[*] Mode: {_describe_mode(args)}")
     print("[*] Scanning...")
 
@@ -196,12 +273,19 @@ def run_scan(args):
         print(f"[!] No hosts returned results after {elapsed:.2f}s.")
         return {}, {}
 
+    # CVE matching — automatic when --script=vuln was requested
     findings = {}
-    if getattr(args, "vuln", False):
-        print("\n[*] Matching services against known CVEs...")
-        findings = match_services(results, min_cvss=args.min_cvss)
+    script_wants_vuln = bool(getattr(args, "script", None)
+                             and "vuln" in args.script)
+    if script_wants_vuln:
+        print("\n[*] SSCAN: matching detected services against CVEs...")
+        findings = match_services(
+            results,
+            min_cvss=getattr(args, "min_cvss", 0.0),
+            use_cache=not getattr(args, "no_cache", False),
+        )
 
-    print_results(results, findings, elapsed)
+    print_results(results, findings, elapsed, cidr=cidr)
     export(results, findings, args)
     return results, findings
 
@@ -218,6 +302,12 @@ def _describe_mode(args):
         parts.append("TCP connect")
     elif args.ack:
         parts.append("TCP ACK")
+    elif getattr(args, "fin", False):
+        parts.append("TCP FIN")
+    elif getattr(args, "null", False):
+        parts.append("TCP NULL")
+    elif getattr(args, "xmas", False):
+        parts.append("TCP Xmas")
     elif args.udp:
         parts.append("UDP")
     if args.service:
