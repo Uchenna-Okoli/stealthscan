@@ -34,7 +34,7 @@ def build_parser():
                "  sudo sscan 10.0.0.1\n"
                "  sudo sscan -sS -sV -p- 10.0.0.1\n"
                "  sudo sscan --subnet 192.168.1.0/24\n"
-               "  sudo sscan --subnet 192.168.1.0/24 -sn\n"
+               "  sudo sscan -sS --vuln-fast --top-ports 100 10.0.0.1\n"
                "  sudo sscan -sS --script=vuln --top-ports 1000 10.0.0.1\n"
                "\nRun with no arguments for interactive mode.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -88,6 +88,9 @@ def build_parser():
                    help="NSE script(s), e.g. --script=vuln. "
                         "Using --script=vuln also triggers CVE matching "
                         "against the NVD database.")
+    v.add_argument("--vuln-fast", action="store_true",
+                   help="Fast vuln scan: NSE scripts only, no NVD API calls. "
+                        "Much faster, slightly less thorough.")
     v.add_argument("--min-cvss", type=float, default=0.0,
                    help="Only report CVEs with CVSS >= this value")
     v.add_argument("--no-cache", action="store_true",
@@ -114,7 +117,6 @@ def build_parser():
 
 
 def _finalize(args):
-    """Post-parse processing: fold --subnet, apply implications, set defaults."""
     if args.subnet:
         args.targets.append(args.subnet)
 
@@ -128,8 +130,11 @@ def _finalize(args):
             "[!] Choose only one of: -sn, -sL, -sS, -sT, -sA, -sF, -sN, -sX, -sU"
         )
 
-    # --script=vuln implies service detection and enables CVE matching.
     if args.script and "vuln" in args.script:
+        args.service = True
+
+    if args.vuln_fast:
+        args.script = "vuln"
         args.service = True
 
     if args.all_ports:
@@ -147,7 +152,6 @@ def _finalize(args):
 def main():
     raw_argv = sys.argv[1:]
 
-    # No arguments → interactive menu
     if not raw_argv:
         argv = menu_module.run_interactive()
         if argv is None:

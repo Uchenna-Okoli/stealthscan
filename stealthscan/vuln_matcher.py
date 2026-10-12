@@ -7,11 +7,10 @@ Strategy: aggressive + smart + cached.
                services with no version info
   cached     — persist results to ~/.cache/sscan/cve_cache.json so
                the same lookup returns instantly on subsequent runs
-               for up to 30 days
+               for up to 90 days
 """
 import json
 import os
-import time
 from datetime import datetime, timedelta
 
 import requests
@@ -20,13 +19,8 @@ import requests
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 CACHE_DIR = os.path.expanduser("~/.cache/sscan")
 CACHE_FILE = os.path.join(CACHE_DIR, "cve_cache.json")
-CACHE_TTL_DAYS = 30
-RATE_LIMIT_DELAY = 0.6  # NVD allows 5 req / 30 s without a key
+CACHE_TTL_DAYS = 90
 
-
-# ---------------------------------------------------------------------------
-# Cache management
-# ---------------------------------------------------------------------------
 
 def _load_cache():
     if not os.path.exists(CACHE_FILE):
@@ -58,12 +52,7 @@ def _is_fresh(entry):
     return datetime.utcnow() - cached_at < timedelta(days=CACHE_TTL_DAYS)
 
 
-# ---------------------------------------------------------------------------
-# NVD query
-# ---------------------------------------------------------------------------
-
 def _query_nvd(product, version, api_key=None):
-    """Query NVD for CVEs matching a product+version. Returns a list of dicts."""
     params = {
         "keywordSearch": f"{product} {version}".strip(),
         "resultsPerPage": 20,
@@ -73,7 +62,7 @@ def _query_nvd(product, version, api_key=None):
         headers["apiKey"] = api_key
 
     try:
-        r = requests.get(NVD_API, params=params, headers=headers, timeout=30)
+        r = requests.get(NVD_API, params=params, headers=headers, timeout=15)
         r.raise_for_status()
     except requests.RequestException as e:
         print(f"[!] NVD lookup failed: {e}")
@@ -100,18 +89,10 @@ def _query_nvd(product, version, api_key=None):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
 def match_services(results, min_cvss=0.0, api_key=None, use_cache=True):
-    """For every open port with a detected product/version, query NVD for CVEs.
-
-    Returns {host: [ {port, service, id, description, score, severity}, ... ]}
-    """
+    """For every open port with a detected product/version, query NVD for CVEs."""
     cache = _load_cache() if use_cache else {}
-    seen_in_run = {}   # dedup within this run
-
+    seen_in_run = {}
     findings = {}
     cache_dirty = False
 
@@ -125,22 +106,16 @@ def match_services(results, min_cvss=0.0, api_key=None, use_cache=True):
                 product = (pdata.get("product") or "").strip()
                 version = (pdata.get("version") or "").strip()
 
-                # Smart skip: no product info → nothing to match against
                 if not product:
                     continue
 
                 label = f"{product} {version}".strip()
                 key = _cache_key(product, version)
 
-                # Cache hit
                 if use_cache and key in cache and _is_fresh(cache[key]):
                     cves = cache[key]["cves"]
-                    source = "cache"
-                # Dedup within this run
                 elif key in seen_in_run:
                     cves = seen_in_run[key]
-                    source = "dedup"
-                # Live query
                 else:
                     print(f"[*] SSCAN: checking {host}:{port} ({label}) for CVEs...")
                     cves = _query_nvd(product, version, api_key)
@@ -153,8 +128,6 @@ def match_services(results, min_cvss=0.0, api_key=None, use_cache=True):
                             "cves": cves,
                         }
                         cache_dirty = True
-                    source = "live"
-                    time.sleep(RATE_LIMIT_DELAY)
 
                 for cve in cves:
                     if cve["score"] < min_cvss:
@@ -162,7 +135,6 @@ def match_services(results, min_cvss=0.0, api_key=None, use_cache=True):
                     findings[host].append({
                         "port": port,
                         "service": label,
-                        "source": source,
                         **cve,
                     })
 

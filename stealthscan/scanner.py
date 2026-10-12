@@ -71,8 +71,13 @@ def build_engine_args(args):
         a.append("--max-os-tries")
         a.append("1")
 
+    # NSE scripts — restrict vuln category to services that actually have scripts
     if getattr(args, "script", None):
-        a.append(f"--script={args.script}")
+        if args.script == "vuln":
+            a.append('--script=vuln and (http or ftp or smb or ssh or '
+                     'ssl or mysql or mssql or oracle or rdp or vnc)')
+        else:
+            a.append(f"--script={args.script}")
 
     a.append(f"-T{args.timing}")
     a.append("--max-retries")
@@ -100,7 +105,6 @@ build_nmap_args = build_engine_args
 # ---------------------------------------------------------------------------
 
 def print_host_report(host, hdata, host_findings, assessment):
-    """Print a single host's report."""
     state = hdata.get("state", "unknown")
     tier = assessment["host_tier"]
     hrisk = assessment["host_risk"]
@@ -120,7 +124,6 @@ def print_host_report(host, hdata, host_findings, assessment):
             print(f"  {'PORT':<8} {'STATE':<10} {'SERVICE':<14} "
                   f"{'VERSION':<28} {'CVEs':<5} {'MAX':<5} RISK")
             print(f"  {'-'*8} {'-'*10} {'-'*14} {'-'*28} {'-'*5} {'-'*5} {'-'*10}")
-
             for port in sorted(ports.keys()):
                 p = ports[port]
                 pa = assessment["ports"].get(port, {})
@@ -146,7 +149,6 @@ def print_host_report(host, hdata, host_findings, assessment):
         if len(host_findings) > 20:
             print(f"    ... and {len(host_findings) - 20} more")
 
-    # Vulnerability density
     if assessment["open_ports"] > 0:
         print(f"\n  Vulnerability density: "
               f"{assessment['ports_with_cves']} of {assessment['open_ports']} "
@@ -157,7 +159,6 @@ def print_host_report(host, hdata, host_findings, assessment):
 
 
 def print_network_summary(net_assessment, cidr):
-    """Print subnet-level aggregate."""
     print("\n" + "=" * 74)
     print(f"  NETWORK RISK SUMMARY — {cidr}")
     print("=" * 74)
@@ -167,14 +168,12 @@ def print_network_summary(net_assessment, cidr):
     print(f"  Total open ports: {net_assessment['total_open_ports']}")
     print(f"  Total CVEs:       {net_assessment['total_cves']}")
     print()
-
     tc = net_assessment["tier_counts"]
     bar_max = max(tc.values()) if tc.values() else 1
     for tier in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "CLEAN"]:
         count = tc.get(tier, 0)
         bar = "█" * int((count / bar_max) * 30) if bar_max else ""
         print(f"    {tier:<9} {count:>3}   {bar}")
-
     print()
     print(f"  Network risk:   {net_assessment['network_tier']} "
           f"({net_assessment['network_risk']:.1f})")
@@ -203,12 +202,10 @@ def print_results(results, findings, elapsed, cidr=None):
         print_host_report(host, results[host],
                           findings.get(host, []), assessment)
 
-    # Subnet summary if there are multiple hosts
     if len(results) > 1:
         label = cidr or "(multiple targets)"
         print_network_summary(net_assessment, label)
     else:
-        # Single host — show a compact summary line
         h = next(iter(net_assessment["hosts"].values()))
         print(f"\n  Summary: {h['total_cves']} CVE(s) across "
               f"{h['open_ports']} open port(s), tier {h['host_tier']}.")
@@ -221,7 +218,6 @@ def print_results(results, findings, elapsed, cidr=None):
 def run_scan(args):
     targets = expand_targets(args.targets)
 
-    # Detect if this is a subnet scan
     cidr = None
     for t in targets:
         if "/" in t:
@@ -273,17 +269,22 @@ def run_scan(args):
         print(f"[!] No hosts returned results after {elapsed:.2f}s.")
         return {}, {}
 
-    # CVE matching — automatic when --script=vuln was requested
+    # CVE matching
     findings = {}
     script_wants_vuln = bool(getattr(args, "script", None)
                              and "vuln" in args.script)
-    if script_wants_vuln:
+    vuln_fast = getattr(args, "vuln_fast", False)
+
+    if script_wants_vuln and not vuln_fast:
         print("\n[*] SSCAN: matching detected services against CVEs...")
         findings = match_services(
             results,
             min_cvss=getattr(args, "min_cvss", 0.0),
             use_cache=not getattr(args, "no_cache", False),
         )
+    elif vuln_fast:
+        print("\n[*] SSCAN: fast mode — NSE script results only, "
+              "skipping NVD lookups.")
 
     print_results(results, findings, elapsed, cidr=cidr)
     export(results, findings, args)
@@ -314,7 +315,9 @@ def _describe_mode(args):
         parts.append("service detection")
     if args.os:
         parts.append("OS detection")
-    if getattr(args, "script", None):
+    if getattr(args, "vuln_fast", False):
+        parts.append("vuln-fast")
+    elif getattr(args, "script", None):
         parts.append(f"NSE:{args.script}")
     parts.append(f"timing T{args.timing}")
     return ", ".join(parts)
