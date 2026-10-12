@@ -1,7 +1,9 @@
-"""Command-line interface for StealthScan."""
+"""Command-line interface for SSCAN."""
 import argparse
 import sys
+
 from .scanner import run_scan
+from . import menu as menu_module
 
 
 def _normalize_argv(argv):
@@ -24,15 +26,17 @@ def _normalize_argv(argv):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="stealthscan",
-        description="StealthScan — network reconnaissance with CVE matching. "
-                    "Only use on networks you own or have written permission to test.",
+        prog="sscan",
+        description="SSCAN — network reconnaissance with vulnerability "
+                    "assessment. Only use on networks you own or have "
+                    "written permission to test.",
         epilog="Examples:\n"
-               "  sudo stealthscan 10.0.0.1\n"
-               "  sudo stealthscan -sS -sV -p- 10.0.0.1\n"
-               "  sudo stealthscan --subnet 192.168.1.0/24\n"
-               "  sudo stealthscan --subnet 192.168.1.0/24 -sn\n"
-               "  sudo stealthscan --subnet 192.168.1.0/24 -sS -sV --top-ports 100\n",
+               "  sudo sscan 10.0.0.1\n"
+               "  sudo sscan -sS -sV -p- 10.0.0.1\n"
+               "  sudo sscan --subnet 192.168.1.0/24\n"
+               "  sudo sscan --subnet 192.168.1.0/24 -sn\n"
+               "  sudo sscan -sS --script=vuln --top-ports 1000 10.0.0.1\n"
+               "\nRun with no arguments for interactive mode.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -41,6 +45,9 @@ def build_parser():
     sub = p.add_argument_group("Subnet")
     sub.add_argument("--subnet", metavar="CIDR",
                      help="Scan an entire subnet, e.g. 192.168.1.0/24")
+    sub.add_argument("--full", action="store_true",
+                     help="When scanning a subnet, scan all 65,535 ports "
+                          "(very slow) instead of the default top 100")
 
     g = p.add_argument_group("Scan Types")
     g.add_argument("--sn", "--ping", action="store_true", dest="ping",
@@ -72,10 +79,13 @@ def build_parser():
 
     v = p.add_argument_group("Vulnerability Scanning")
     v.add_argument("--script", dest="script", metavar="NAME",
-                   help="NSE script(s), e.g. --script=vuln")
-    v.add_argument("--vuln", action="store_true",
-                   help="Quick vuln scan (implies --script=vuln --sV)")
-    v.add_argument("--min-cvss", type=float, default=0.0)
+                   help="NSE script(s), e.g. --script=vuln. "
+                        "Using --script=vuln also triggers CVE matching "
+                        "against the NVD database.")
+    v.add_argument("--min-cvss", type=float, default=0.0,
+                   help="Only report CVEs with CVSS >= this value")
+    v.add_argument("--no-cache", action="store_true",
+                   help="Bypass the local CVE cache for this run")
 
     s = p.add_argument_group("Stealth / Evasion")
     s.add_argument("-T", "--timing", choices=list("012345"), default="4",
@@ -97,10 +107,8 @@ def build_parser():
     return p
 
 
-def main():
-    args = build_parser().parse_args(_normalize_argv(sys.argv[1:]))
-
-    # Fold --subnet into targets
+def _finalize(args):
+    """Post-parse processing: fold --subnet, apply implications, set defaults."""
     if args.subnet:
         args.targets.append(args.subnet)
 
@@ -112,17 +120,36 @@ def main():
     if sum(bool(x) for x in scans) > 1:
         raise SystemExit("[!] Choose only one of: -sn, -sL, -sS, -sT, -sA, -sU")
 
-    if args.vuln:
-        if not args.script:
-            args.script = "vuln"
+    # --script=vuln implies service detection and enables CVE matching.
+    if args.script and "vuln" in args.script:
         args.service = True
 
     if args.all_ports:
         args.ports = "-"
 
+    # --full is a subnet convenience: expand to all ports
+    if args.full and not args.ports and not args.top_ports:
+        args.ports = "-"
+
+    # Default scan type: SYN
     if not any(scans):
         args.syn = True
 
+    return args
+
+
+def main():
+    raw_argv = sys.argv[1:]
+
+    # No arguments → interactive menu
+    if not raw_argv:
+        argv = menu_module.run_interactive()
+        if argv is None:
+            sys.exit(0)
+        raw_argv = argv
+
+    args = build_parser().parse_args(_normalize_argv(raw_argv))
+    args = _finalize(args)
     run_scan(args)
 
 
